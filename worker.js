@@ -198,4 +198,62 @@ route("POST","/chat/conversations/(\\d+)/messages",async c=>{
   await q(c,"UPDATE private_conversation_participants SET last_read_id=? WHERE conversation_id=? AND user_id=?",r.meta.last_row_id,cv,u.id).run(); // your own messages are never unread
   const msg=shape(await q(c,PRIV+" WHERE m.id=?",r.meta.last_row_id).first());await emit(c.env,{t:"priv",conv:cv,msg},[u.id,o.user_id]);return J({message:msg})});
 route("POST","/chat/conversations/(\\d+)/read",async c=>{const u=need(c),cv=+c.p[0];await part(c,cv);
-  await q(c,"UPDATE pr
+  await q(c,"UPDATE private_conversation_participants SET last_read_id=(SELECT COALESCE(MAX(id),0) FROM private_messages WHERE conversation_id=?1) WHERE conversation_id=?1 AND user_id=?2",cv,u.id).run();
+  return J({privUnread:await privUnread(c,u.id)})});
+route("POST","/chat/block",async c=>{
+  const u=need(c),b=await body(c.req),t=str(b.userId,60);if(t===u.id)return J({error:"Invalid request"},400);
+  if(b.blocked)await q(c,"INSERT OR IGNORE INTO user_relations(user_id,target_id,kind,created_at) VALUES(?,?,'block',?)",u.id,t,now()).run();
+  else await q(c,"DELETE FROM user_relations WHERE user_id=? AND target_id=? AND kind='block'",u.id,t).run();
+  return J({ok:true})});
+route("POST","/chat/report",async c=>{
+  const u=need(c),b=await body(c.req),sc=b.scope==="public"?"public":"private",mid=+b.messageId,why=str(b.reason,300);
+  const row=sc==="public"?await q(c,"SELECT sender_id,body FROM public_chat_messages WHERE id=?",mid).first()
+    :await q(c,"SELECT m.sender_id,m.body FROM private_messages m JOIN private_conversation_participants p ON p.conversation_id=m.conversation_id AND p.user_id=? WHERE m.id=?",u.id,mid).first();
+  if(!row||row.sender_id===u.id)return J({error:"Message not found"},404);
+  await q(c,"INSERT INTO chat_reports(reporter_id,reported_user_id,scope,message_id,body,reason,created_at) VALUES(?,?,?,?,?,?,?)",u.id,row.sender_id,sc,mid,row.body,why,now()).run();return J({ok:true})});
+route("GET","/admin/chat-reports",async c=>{const u=need(c);if(u.role!=="admin")return J({error:"Not allowed"},403); // only the reported message is shared, never the whole chat
+  return J({reports:(await q(c,"SELECT id,scope,reported_user_id,body,reason,status,created_at t FROM chat_reports ORDER BY id DESC LIMIT 100").all()).results})});
+
+// ---------- Help & Support: user <-> Admin only, deleted 24 hours after creation ----------
+route("GET","/support",async c=>{const u=need(c);
+  return J({messages:(await q(c,"SELECT id,is_admin_reply,body,media_key,created_at t FROM support_messages WHERE user_id=? AND created_at>? ORDER BY id",u.id,now()-864e5).all()).results.map(m=>({...m,media:mediaUrl(m.media_key)}))})});
+route("POST","/support",async c=>{const u=need(c),b=await body(c.req),t=str(b.body,1000),mk=str(b.media,120);if(!t&&!mk)return J({error:"Write a message first"},400);
+  if(mk&&!await ownMedia(c,mk,u.id,"support"))return J({error:"Invalid attachment"},400);
+  await q(c,"INSERT INTO support_messages(user_id,sender_id,is_admin_reply,body,media_key,created_at) VALUES(?,?,0,?,?,?)",u.id,u.id,t,mk||null,now()).run();return J({ok:true})});
+route("GET","/admin/support",async c=>{const u=need(c);if(u.role!=="admin")return J({error:"Not allowed"},403); // the Chairman is excluded on purpose
+  return J({messages:(await q(c,"SELECT s.id,s.user_id,u.name,s.is_admin_reply,s.body,s.media_key,s.created_at t FROM support_messages s JOIN users u ON u.id=s.user_id WHERE s.created_at>? ORDER BY s.id",now()-864e5).all()).results.map(m=>({...m,media:mediaUrl(m.media_key)}))})});
+route("POST","/admin/support/([^/]+)",async c=>{const u=need(c);if(u.role!=="admin")return J({error:"Not allowed"},403);
+  const b=await body(c.req),t=str(b.body,1000);if(!t)return J({error:"Write a reply first"},400);
+  await q(c,"INSERT INTO support_messages(user_id,sender_id,is_admin_reply,body,created_at) VALUES(?,?,1,?,?)",c.p[0],u.id,t,now()).run();return J({ok:true})});
+async function cleanup(env){ // run by the cron trigger every minute: permanent deletion of rows and pictures
+  const rs=(await env.DB.prepare("SELECT id,media_key FROM support_messages WHERE created_at<? LIMIT 200").bind(now()-864e5).all()).results;
+  for(const r of rs){if(r.media_key){await env.MEDIA.delete(r.media_key);await env.DB.prepare("DELETE FROM media WHERE key=?").bind(r.media_key).run()}
+    await env.DB.prepare("DELETE FROM support_messages WHERE id=?").bind(r.id).run()}
+  await env.DB.prepare("DELETE FROM sessions WHERE expires_at<?").bind(now()).run()}
+
+route("GET","/ws",async c=>{const u=need(c);if(c.req.headers.get("Upgrade")!=="websocket")return J({error:"Expected WebSocket"},426);
+  return hub(c.env).fetch(new Request("https://hub/ws?u="+encodeURIComponent(u.id),c.req))});
+
+export default{
+  async fetch(req,env){
+    const url=new URL(req.url);
+    if(!url.pathname.startsWith("/api/"))return env.ASSETS.fetch(req);
+    if(!["GET","HEAD"].includes(req.method)){const o=req.headers.get("Origin");if(o&&o!==url.origin)return J({error:"Bad origin"},403)}
+    const u=await who(req,env);
+    for(const[m,re,fn]of routes){if(m!==req.method)continue;const x=re.exec(url.pathname.slice(4));
+      if(x){try{return await fn({req,env,u,url,p:x.slice(1)})}catch(e){if(e instanceof Response)return e;console.error(e);return J({error:"Server error"},500)}}}
+    return J({error:"Not found"},404)},
+  async scheduled(ev,env,ctx){ctx.waitUntil(cleanup(env))}};
+
+// Durable Object: keeps WebSocket connections and relays events. Reachable only through the Worker above.
+export class ChatRoom{
+  constructor(state){this.state=state}
+  async fetch(req){
+    const url=new URL(req.url);
+    if(url.pathname==="/ws"){const[c,s]=Object.values(new WebSocketPair());this.state.acceptWebSocket(s,[url.searchParams.get("u")]);return new Response(null,{status:101,webSocket:c})}
+    if(url.pathname==="/emit"){const{event,to}=await req.json();
+      for(const ws of this.state.getWebSockets())if(!to||this.state.getTags(ws).some(t=>to.includes(t)))try{ws.send(JSON.stringify(event))}catch{}
+      return new Response("ok")}
+    return new Response("Not found",{status:404})}
+  webSocketMessage(){}
+  webSocketClose(ws){try{ws.close()}catch{}}}
