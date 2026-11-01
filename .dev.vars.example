@@ -1,0 +1,3 @@
+# Names only. For local testing copy to .dev.vars and fill in. Never commit real values.
+ADMIN_EMAIL=
+CHAIRMAN_EMAIL=
