@@ -28,5 +28,5 @@ new_sqlite_classes = ["ChatRoom"]
 crons = ["* * * * *"]
 
 [vars]
-ADMIN_EMAIL = ""
-CHAIRMAN_EMAIL = ""
+ADMIN_EMAIL = "umarsaraki96@gmail.com"
+CHAIRMAN_EMAIL = "umarshoyi@gmail.com"
