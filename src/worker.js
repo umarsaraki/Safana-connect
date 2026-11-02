@@ -251,6 +251,9 @@ route("POST","/login",async c=>{
   if(!same(await pbk(pw,unhex(u.pass_salt)),u.pass_hash)){
     const f=u.fail_count+1;await q(c,"UPDATE users SET fail_count=?,locked_until=? WHERE id=?",f>=5?0:f,f>=5?now()+9e5:0,u.id).run();return bad}
   await q(c,"UPDATE users SET fail_count=0,locked_until=0,status='active' WHERE id=?",u.id).run(); // logging in reactivates a deactivated account
+  const ae=(c.env.ADMIN_EMAIL||"").trim().toLowerCase(),ce=(c.env.CHAIRMAN_EMAIL||"").trim().toLowerCase(); // the account with the configured email holds that role, even if it registered before the email was configured
+  const want=ae&&u.email===ae?"admin":ce&&u.email===ce&&u.role!=="admin"?"chairman":u.role;
+  if(want!==u.role){await q(c,"UPDATE users SET role=? WHERE id=?",want,u.id).run();u.role=want}
   return startSession(c,u)});
 route("POST","/logout",async c=>{const t=cookie(c.req).sc;if(t)await q(c,"DELETE FROM sessions WHERE token_hash=?",await sha(t)).run();
   return J({ok:true},200,{"Set-Cookie":"sc=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0"})});
@@ -317,7 +320,7 @@ route("POST","/media",async c=>{
   if(kind==="video"){if(sc!=="post"||f.size>15e6)return J({error:"Video must be an MP4 under 15 MB"},413);
     const d=await mp4Seconds(f);if(!d)return J({error:"Could not read the video length"},400);if(d>30.5)return J({error:"Video must be 30 seconds or shorter"},400)}
   const key=`${u.id}/${crypto.randomUUID()}`;
-  await bucket(c.env).put(key,f.stream(),{httpMetadata:{contentType:ct}});
+  await bucket(c.env).put(key,await f.arrayBuffer(),{httpMetadata:{contentType:ct}});
   await q(c,"INSERT INTO media(key,owner_id,scope,conv_id,kind,created_at) VALUES(?,?,?,?,?,?)",key,u.id,sc,sc==="private"?conv:null,kind,now()).run();
   return J({key,url:mediaUrl(key),kind},201)});
 route("GET","/media/(.+)",async c=>{
@@ -439,14 +442,30 @@ async function cleanup(env){ // run by the cron trigger every minute: permanent 
 route("GET","/ws",async c=>{const u=need(c);if(c.req.headers.get("Upgrade")!=="websocket")return J({error:"Expected WebSocket"},426);
   return hub(c.env).fetch(new Request("https://hub/ws?u="+encodeURIComponent(u.id),c.req))});
 
+let schemaReady=null;
+async function ensureSchema(env){ // adds anything an older database is missing, so no manual SQL is needed
+  const cols=async t=>(await env.DB.prepare(`PRAGMA table_info(${t})`).all()).results.map(r=>r.name);
+  const add=async(t,c,def)=>{if(!(await cols(t)).includes(c))await env.DB.prepare(`ALTER TABLE ${t} ADD COLUMN ${c} ${def}`).run()};
+  await add("posts","likes_adjust","INTEGER NOT NULL DEFAULT 0");await add("users","followers_adjust","INTEGER NOT NULL DEFAULT 0");await add("media","kind","TEXT NOT NULL DEFAULT 'image'");
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS post_shares(post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, created_at INTEGER NOT NULL, PRIMARY KEY(post_id,user_id))").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS stories(id INTEGER PRIMARY KEY AUTOINCREMENT, author_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, media_key TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'image', caption TEXT, created_at INTEGER NOT NULL)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_stories_time ON stories(created_at)").run()}
+const ensureReady=env=>{if(!schemaReady)schemaReady=ensureSchema(env).catch(e=>{schemaReady=null;throw e});return schemaReady};
+const msg=e=>String(e&&e.message||e).slice(0,140);
+async function health(env){const out={database:false,pictures_bucket:!!bucket(env),realtime:!!env.HUB,admin_email_set:!!(env.ADMIN_EMAIL||"").trim(),chairman_email_set:!!(env.CHAIRMAN_EMAIL||"").trim()};
+  try{await ensureReady(env);const ti=async t=>(await env.DB.prepare(`PRAGMA table_info(${t})`).all()).results.map(r=>r.name);
+    out.database=true;out.tables=(await env.DB.prepare("SELECT COUNT(*) n FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").first()).n;
+    out.columns_ok=(await ti("posts")).includes("likes_adjust")&&(await ti("users")).includes("followers_adjust")&&(await ti("media")).includes("kind")}catch(e){out.error=msg(e)}
+  return J(out)}
 export default{
   async fetch(req,env){
     const url=new URL(req.url);
     if(!url.pathname.startsWith("/api/"))return env.ASSETS.fetch(req);
     if(!["GET","HEAD"].includes(req.method)){const o=req.headers.get("Origin");if(o&&o!==url.origin)return J({error:"Bad origin"},403)}
-    const u=await who(req,env);
+    if(url.pathname==="/api/health")return health(env);
+    let u=null;try{await ensureReady(env);u=await who(req,env)}catch(e){console.error(e);return J({error:"Server error: "+msg(e)},500)}
     for(const[m,re,fn]of routes){if(m!==req.method)continue;const x=re.exec(url.pathname.slice(4));
-      if(x){try{return await fn({req,env,u,url,p:x.slice(1)})}catch(e){if(e instanceof Response)return e;console.error(e);return J({error:"Server error"},500)}}}
+      if(x){try{return await fn({req,env,u,url,p:x.slice(1)})}catch(e){if(e instanceof Response)return e;console.error(e);return J({error:"Server error: "+msg(e)},500)}}}
     return J({error:"Not found"},404)},
   async scheduled(ev,env,ctx){ctx.waitUntil(cleanup(env))}};
 
