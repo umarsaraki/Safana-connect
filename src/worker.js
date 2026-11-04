@@ -45,24 +45,28 @@ const J2=a=>JSON.stringify(a);
 const UC="u.id,u.name,u.username,u.bio,u.location,u.avatar_key,u.cover_key,u.role,u.status,u.followers_adjust fa,(SELECT COUNT(*) FROM follows f WHERE f.following_id=u.id) fc,(SELECT COUNT(*) FROM follows f WHERE f.follower_id=u.id) gc";
 const uo=r=>({id:r.id,name:r.name,user:r.username,bio:r.bio||"",loc:r.location||"",avatar:mediaUrl(r.avatar_key),cover:mediaUrl(r.cover_key),verified:r.role==="chairman",role:r.role,status:r.status,followers:r.fc+(r.fa||0),following:r.gc,isFollowing:!!r.isf});
 const usersByIds=async(c,ids)=>{const out={};if(!ids.length)return out;for(const r of(await q(c,`SELECT ${UC},EXISTS(SELECT 1 FROM follows x WHERE x.follower_id=?2 AND x.following_id=u.id) isf FROM users u WHERE u.id IN (SELECT value FROM json_each(?1))`,J2([...new Set(ids)]),c.u?c.u.id:"").all()).results)out[r.id]=uo(r);return out};
-const note=async(c,to,text)=>{if(!to||to===c.u.id)return;await q(c,"INSERT INTO notifications(user_id,kind,message,created_at) VALUES(?,?,?,?)",to,"social",text,now()).run();await emit(c.env,{t:"note"},[to])};
+const note=async(c,to,text,ref="")=>{if(!to||to===c.u.id)return;await q(c,"INSERT INTO notifications(user_id,kind,message,ref,created_at) VALUES(?,?,?,?,?)",to,"social",text,ref,now()).run();await emit(c.env,{t:"note"},[to])};
 const by=(a,k)=>a.reduce((m,x)=>((m[x[k]]=m[x[k]]||[]).push(x),m),{});
-const PSEL="SELECT p.id,p.author_id,p.body,p.is_official,p.created_at,p.likes_adjust FROM posts p JOIN users a ON a.id=p.author_id";
+const PSEL="SELECT p.id,p.author_id,p.body,p.is_official,p.created_at,p.likes_adjust,p.bg FROM posts p JOIN users a ON a.id=p.author_id";
+const BGK=["royal","purple","crimson","emerald","gold","sunset","ocean","midnight","paper","dots","stripes","waves","ornate","apc","pdp","adc","apga"];
 const VIS="a.status='active' AND p.author_id NOT IN (SELECT target_id FROM user_relations WHERE user_id=?2 AND kind IN ('block','mute')) AND p.author_id NOT IN (SELECT user_id FROM user_relations WHERE target_id=?2 AND kind='block')";
 async function shapePosts(c,rows){
   if(!rows.length)return{posts:[],users:{}};
   const j=J2(rows.map(r=>r.id)),IN="post_id IN (SELECT value FROM json_each(?1))";
-  const[md,lk,cm,sh,sv]=(await c.env.DB.batch([
+  const[md,lk,cm,sh,sv,pv,cl]=(await c.env.DB.batch([
     q(c,`SELECT post_id,media_key,kind FROM post_media WHERE ${IN} ORDER BY id`,j),
     q(c,`SELECT post_id,user_id FROM likes WHERE ${IN} ORDER BY created_at`,j),
     q(c,`SELECT id,post_id,parent_id,author_id,body,created_at FROM comments WHERE ${IN} ORDER BY id`,j),
     q(c,`SELECT post_id,user_id FROM post_shares WHERE ${IN}`,j),
-    q(c,`SELECT post_id FROM saved_posts WHERE user_id=?2 AND ${IN}`,j,c.u.id)])).map(x=>x.results);
+    q(c,`SELECT post_id FROM saved_posts WHERE user_id=?2 AND ${IN}`,j,c.u.id),
+    q(c,`SELECT post_id,kind,COUNT(*) n FROM post_views WHERE ${IN} GROUP BY post_id,kind`,j),
+    q(c,"SELECT cl.comment_id,cl.user_id FROM comment_likes cl JOIN comments c ON c.id=cl.comment_id WHERE c.post_id IN (SELECT value FROM json_each(?1))",j)])).map(x=>x.results);
+  const PV=by(pv,"post_id"),CL=by(cl,"comment_id"),cls=id=>(CL[id]||[]).map(x=>x.user_id);
   const M=by(md,"post_id"),L=by(lk,"post_id"),C=by(cm,"post_id"),S=by(sh,"post_id"),sv_=new Set(sv.map(x=>x.post_id));
   const users=await usersByIds(c,[...rows.map(r=>r.author_id),...lk.map(x=>x.user_id),...cm.map(x=>x.author_id),...sh.map(x=>x.user_id)]);
-  return{users,posts:rows.map(r=>{const cs=C[r.id]||[];return{id:r.id,author:r.author_id,body:(r.body||"").trim(),t:r.created_at,official:!!r.is_official,adj:r.likes_adjust,
+  return{users,posts:rows.map(r=>{const cs=C[r.id]||[];return{id:r.id,author:r.author_id,body:(r.body||"").trim(),t:r.created_at,official:!!r.is_official,adj:r.likes_adjust,bg:r.bg||"",views:{post:((PV[r.id]||[]).find(v=>v.kind==="post")||{}).n||0,reel:((PV[r.id]||[]).find(v=>v.kind==="reel")||{}).n||0},
     media:(M[r.id]||[]).map(m=>({url:mediaUrl(m.media_key),kind:m.kind})),likes:(L[r.id]||[]).map(x=>x.user_id),shares:(S[r.id]||[]).map(x=>x.user_id),saved:sv_.has(r.id),
-    comments:cs.filter(x=>!x.parent_id).map(x=>({id:x.id,a:x.author_id,txt:x.body,t:x.created_at,rep:cs.filter(y=>y.parent_id===x.id).map(y=>({id:y.id,a:y.author_id,txt:y.body,t:y.created_at}))}))}})}}
+    comments:cs.filter(x=>!x.parent_id).map(x=>({id:x.id,a:x.author_id,txt:x.body,t:x.created_at,likes:cls(x.id),rep:cs.filter(y=>y.parent_id===x.id).map(y=>({id:y.id,a:y.author_id,txt:y.body,t:y.created_at,likes:cls(y.id)}))}))}})}}
 async function dropPost(c,id){for(const k of(await q(c,"SELECT media_key k FROM post_media WHERE post_id=?",id).all()).results){await bucket(c.env).delete(k.k);await q(c,"DELETE FROM media WHERE key=?",k.k).run()}await q(c,"DELETE FROM posts WHERE id=?",id).run()}
 async function convWith(c,uid,t){
   if(t===uid||!await q(c,"SELECT 1 FROM users WHERE id=? AND status='active'",t).first()||await blocked(c,uid,t))return 0;
@@ -86,31 +90,32 @@ route("GET","/posts/(\\d+)",async c=>{const u=need(c),r=(await q(c,`${PSEL} WHER
 route("POST","/posts",async c=>{
   const u=need(c),b=await body(c.req),t=str(b.body,2000),keys=(Array.isArray(b.media)?b.media:[]).slice(0,5).map(k=>str(k,120));
   if(!t&&!keys.length)return J({error:"Write something or add a picture or video"},400);
+  const bg=b.bg?str(b.bg,20):"";if(bg&&(!BGK.includes(bg)||keys.length||t.length>280))return J({error:"Colourful backgrounds are for short text posts (280 characters)"},400);
   const kinds=[];for(const k of keys){const m=await q(c,"SELECT kind FROM media WHERE key=? AND owner_id=? AND scope='post'",k,u.id).first();if(!m)return J({error:"Invalid attachment"},400);kinds.push(m.kind)}
   if(kinds.includes("video")&&kinds.length>1)return J({error:"Add up to 5 pictures, or one video"},400);
-  const off=b.official&&staff(u)?1:0,r=await q(c,"INSERT INTO posts(author_id,body,is_official,created_at) VALUES(?,?,?,?)",u.id,t||" ",off,now()).run(),id=r.meta.last_row_id;
+  const off=b.official&&staff(u)?1:0,r=await q(c,"INSERT INTO posts(author_id,body,is_official,bg,created_at) VALUES(?,?,?,?,?)",u.id,t||" ",off,bg||null,now()).run(),id=r.meta.last_row_id;
   if(keys.length)await c.env.DB.batch(keys.map((k,i)=>q(c,"INSERT INTO post_media(post_id,media_key,kind) VALUES(?,?,?)",id,k,kinds[i])));
   if(off){await q(c,"INSERT INTO notifications(user_id,kind,message,created_at) SELECT id,'official',?,? FROM users WHERE status='active' AND id<>?",`New announcement from ${u.name}`,now(),u.id).run();await emit(c.env,{t:"note"})}
-  return J({id},201)});
+  await emit(c.env,{t:"np"});return J({id},201)});
 route("DELETE","/posts/(\\d+)",async c=>{const u=need(c),id=+c.p[0],p=await q(c,"SELECT author_id FROM posts WHERE id=?",id).first();
   if(!p)return J({error:"Not found"},404);if(p.author_id!==u.id&&u.role!=="admin")return J({error:"Not allowed"},403);await dropPost(c,id);return J({ok:true})});
 route("POST","/posts/(\\d+)/like",async c=>{const u=need(c),id=+c.p[0],p=await q(c,"SELECT author_id FROM posts WHERE id=?",id).first();if(!p)return J({error:"Not found"},404);
   if(await q(c,"SELECT 1 FROM likes WHERE post_id=? AND user_id=?",id,u.id).first())await q(c,"DELETE FROM likes WHERE post_id=? AND user_id=?",id,u.id).run();
-  else{await q(c,"INSERT INTO likes(post_id,user_id,created_at) VALUES(?,?,?)",id,u.id,now()).run();await note(c,p.author_id,`${u.name} liked your post.`)}
-  return J({likes:(await q(c,"SELECT user_id FROM likes WHERE post_id=?",id).all()).results.map(x=>x.user_id)})});
+  else{await q(c,"INSERT INTO likes(post_id,user_id,created_at) VALUES(?,?,?)",id,u.id,now()).run();await note(c,p.author_id,`${u.name} liked your post.`,`post:${id}`)}
+  await emit(c.env,{t:"pu",id});return J({likes:(await q(c,"SELECT user_id FROM likes WHERE post_id=?",id).all()).results.map(x=>x.user_id)})});
 route("POST","/posts/(\\d+)/comments",async c=>{
   const u=need(c),id=+c.p[0],b=await body(c.req),t=str(b.body,500),par=b.parent?+b.parent:null;if(!t)return J({error:"Write a comment first"},400);
   const p=await q(c,"SELECT author_id,comments_enabled FROM posts WHERE id=?",id).first();if(!p)return J({error:"Not found"},404);if(!p.comments_enabled)return J({error:"Comments are turned off"},403);
   let pa=null;if(par){pa=await q(c,"SELECT author_id,parent_id FROM comments WHERE id=? AND post_id=?",par,id).first();if(!pa)return J({error:"Not found"},404)}
   await q(c,"INSERT INTO comments(post_id,parent_id,author_id,body,created_at) VALUES(?,?,?,?,?)",id,pa?(pa.parent_id||par):null,u.id,t,now()).run();
-  if(pa)await note(c,pa.author_id,`${u.name} replied to your comment.`);
-  if(!pa||pa.author_id!==p.author_id)await note(c,p.author_id,`${u.name} commented on your post.`);
-  for(const m of[...new Set((t.match(/@[a-z0-9_]{3,30}/gi)||[]).map(x=>x.slice(1).toLowerCase()))].slice(0,5)){const x=await q(c,"SELECT id FROM users WHERE username=?",m).first();if(x&&(!pa||x.id!==pa.author_id))await note(c,x.id,`${u.name} mentioned you in a comment.`)}
-  return J({ok:true},201)});
+  if(pa)await note(c,pa.author_id,`${u.name} replied to your comment.`,`post:${id}:c`);
+  if(!pa||pa.author_id!==p.author_id)await note(c,p.author_id,`${u.name} commented on your post.`,`post:${id}:c`);
+  for(const m of[...new Set((t.match(/@[a-z0-9_]{3,30}/gi)||[]).map(x=>x.slice(1).toLowerCase()))].slice(0,5)){const x=await q(c,"SELECT id FROM users WHERE username=?",m).first();if(x&&(!pa||x.id!==pa.author_id))await note(c,x.id,`${u.name} mentioned you in a comment.`,`post:${id}:c`)}
+  await emit(c.env,{t:"pu",id});return J({ok:true},201)});
 route("POST","/posts/(\\d+)/share",async c=>{const u=need(c),id=+c.p[0],b=await body(c.req),p=await q(c,"SELECT author_id FROM posts WHERE id=?",id).first();if(!p)return J({error:"Not found"},404);
-  await q(c,"INSERT OR IGNORE INTO post_shares(post_id,user_id,created_at) VALUES(?,?,?)",id,u.id,now()).run();await note(c,p.author_id,`${u.name} shared your post.`);
+  await q(c,"INSERT OR IGNORE INTO post_shares(post_id,user_id,created_at) VALUES(?,?,?)",id,u.id,now()).run();await note(c,p.author_id,`${u.name} shared your post.`,`post:${id}`);
   for(const to of(Array.isArray(b.to)?b.to:[]).slice(0,5))await sendDM(c,u,str(to,60),str(b.link,300));
-  return J({count:(await q(c,"SELECT COUNT(*) n FROM post_shares WHERE post_id=?",id).first()).n})});
+  await emit(c.env,{t:"pu",id});return J({count:(await q(c,"SELECT COUNT(*) n FROM post_shares WHERE post_id=?",id).first()).n})});
 route("POST","/posts/(\\d+)/save",async c=>{const u=need(c),id=+c.p[0];
   if(await q(c,"SELECT 1 FROM saved_posts WHERE user_id=? AND post_id=?",u.id,id).first()){await q(c,"DELETE FROM saved_posts WHERE user_id=? AND post_id=?",u.id,id).run();return J({saved:false})}
   await q(c,"INSERT INTO saved_posts(user_id,post_id,created_at) VALUES(?,?,?)",u.id,id,now()).run();return J({saved:true})});
@@ -126,21 +131,21 @@ route("GET","/users/([^/]+)",async c=>{
   const u=need(c),t=await q(c,`SELECT ${UC},EXISTS(SELECT 1 FROM follows x WHERE x.follower_id=?2 AND x.following_id=u.id) isf FROM users u WHERE u.id=?1 AND u.status='active'`,c.p[0],u.id).first();
   if(!t||await blocked(c,u.id,t.id))return J({error:"Not found"},404);
   const d=await shapePosts(c,(await q(c,`${PSEL} WHERE p.author_id=?1 AND ${VIS} ORDER BY p.id DESC LIMIT 40`,t.id,u.id).all()).results);
-  return J({user:{...uo(t),isFollowing:!!t.isf},posts:d.posts,users:{...d.users,[t.id]:uo(t)}})});
+  const pc=(await q(c,"SELECT COUNT(*) n FROM posts WHERE author_id=?",t.id).first()).n;return J({user:{...uo(t),isFollowing:!!t.isf,postsCount:pc},posts:d.posts,users:{...d.users,[t.id]:uo(t)}})});
 route("POST","/follow",async c=>{const u=need(c),b=await body(c.req),t=str(b.userId,60);if(t===u.id)return J({error:"Invalid request"},400);
   if(!await q(c,"SELECT 1 FROM users WHERE id=? AND status='active'",t).first()||await blocked(c,u.id,t))return J({error:"Not found"},404);
-  if(b.follow){const r=await q(c,"INSERT OR IGNORE INTO follows(follower_id,following_id,created_at) VALUES(?,?,?)",u.id,t,now()).run();if(r.meta.changes)await note(c,t,`${u.name} started following you.`)}
+  if(b.follow){const r=await q(c,"INSERT OR IGNORE INTO follows(follower_id,following_id,created_at) VALUES(?,?,?)",u.id,t,now()).run();if(r.meta.changes)await note(c,t,`${u.name} started following you.`,`user:${u.id}`)}
   else await q(c,"DELETE FROM follows WHERE follower_id=? AND following_id=?",u.id,t).run();return J({ok:true})});
 route("GET","/notifications",async c=>{const u=need(c);
-  return J({notes:(await q(c,"SELECT id,message txt,is_read r,created_at t FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 60",u.id).all()).results.map(x=>({...x,read:!!x.r}))})});
+  return J({notes:(await q(c,"SELECT id,message txt,ref,is_read r,created_at t FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 60",u.id).all()).results.map(x=>({...x,read:!!x.r}))})});
 route("POST","/notifications/read",async c=>{const u=need(c);await q(c,"UPDATE notifications SET is_read=1 WHERE user_id=?",u.id).run();return J({ok:true})});
 
 route("POST","/stories",async c=>{const u=need(c),b=await body(c.req),k=str(b.media,120),m=await q(c,"SELECT kind FROM media WHERE key=? AND owner_id=? AND scope='post'",k,u.id).first();
   if(!m)return J({error:"Invalid attachment"},400);
   await q(c,"INSERT INTO stories(author_id,media_key,kind,caption,created_at) VALUES(?,?,?,?,?)",u.id,k,m.kind,str(b.caption,120),now()).run();return J({ok:true},201)});
 route("GET","/stories",async c=>{const u=need(c);
-  const rs=(await q(c,`SELECT s.id,s.author_id,s.media_key,s.kind,s.caption,s.created_at FROM stories s JOIN users a ON a.id=s.author_id WHERE s.created_at>?3 AND a.status='active' AND (s.author_id=?2 OR s.author_id IN (SELECT following_id FROM follows WHERE follower_id=?2) OR a.role IN ('chairman','admin')) AND s.author_id NOT IN (SELECT target_id FROM user_relations WHERE user_id=?2 AND kind IN ('block','mute')) ORDER BY s.id`,0,u.id,now()-864e5).all()).results;
-  const users=await usersByIds(c,rs.map(r=>r.author_id)),g={};for(const r of rs)(g[r.author_id]=g[r.author_id]||[]).push({id:r.id,url:mediaUrl(r.media_key),kind:r.kind,caption:r.caption||"",t:r.created_at});
+  const rs=(await q(c,`SELECT s.id,s.author_id,s.media_key,s.kind,s.caption,s.created_at,(SELECT COUNT(*) FROM story_views v WHERE v.story_id=s.id) vc,EXISTS(SELECT 1 FROM story_views v WHERE v.story_id=s.id AND v.user_id=?2) sn FROM stories s JOIN users a ON a.id=s.author_id WHERE s.created_at>?3 AND a.status='active' AND (s.author_id=?2 OR s.author_id IN (SELECT following_id FROM follows WHERE follower_id=?2) OR a.role IN ('chairman','admin')) AND s.author_id NOT IN (SELECT target_id FROM user_relations WHERE user_id=?2 AND kind IN ('block','mute')) ORDER BY s.id`,0,u.id,now()-864e5).all()).results;
+  const users=await usersByIds(c,rs.map(r=>r.author_id)),g={};for(const r of rs)(g[r.author_id]=g[r.author_id]||[]).push({id:r.id,url:mediaUrl(r.media_key),kind:r.kind,caption:r.caption||"",t:r.created_at,seen:!!r.sn||r.author_id===u.id,views:r.author_id===u.id||u.role==="admin"?r.vc:null});
   return J({users,stories:Object.entries(g).map(([id,items])=>({user:id,items}))})});
 route("DELETE","/stories/(\\d+)",async c=>{const u=need(c),s=await q(c,"SELECT author_id,media_key FROM stories WHERE id=?",+c.p[0]).first();if(!s)return J({error:"Not found"},404);
   if(s.author_id!==u.id&&u.role!=="admin")return J({error:"Not allowed"},403);await bucket(c.env).delete(s.media_key);await q(c,"DELETE FROM media WHERE key=?",s.media_key).run();await q(c,"DELETE FROM stories WHERE id=?",+c.p[0]).run();return J({ok:true})});
@@ -225,6 +230,25 @@ route("POST","/admin/reports/(\\d+)/resolve",async c=>{adm(c);const b=await body
   return J({ok:true})});
 route("POST","/admin/broadcast",async c=>{adm(c);const m=str((await body(c.req)).message,200);if(!m)return J({error:"Write a message first"},400);
   await q(c,"INSERT INTO notifications(user_id,kind,message,created_at) SELECT id,'broadcast',?,? FROM users WHERE status='active'",m,now()).run();await emit(c.env,{t:"note"});return J({ok:true})});
+
+
+route("POST","/notifications/(\\d+)/read",async c=>{const u=need(c);await q(c,"UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?",+c.p[0],u.id).run();return J({ok:true})});
+route("POST","/comments/(\\d+)/like",async c=>{const u=need(c),id=+c.p[0],cm=await q(c,"SELECT author_id,post_id FROM comments WHERE id=?",id).first();if(!cm)return J({error:"Not found"},404);
+  if(await q(c,"SELECT 1 FROM comment_likes WHERE comment_id=? AND user_id=?",id,u.id).first())await q(c,"DELETE FROM comment_likes WHERE comment_id=? AND user_id=?",id,u.id).run();
+  else{await q(c,"INSERT INTO comment_likes(comment_id,user_id,created_at) VALUES(?,?,?)",id,u.id,now()).run();await note(c,cm.author_id,`${u.name} liked your comment.`,`post:${cm.post_id}:c`)}
+  await emit(c.env,{t:"pu",id:cm.post_id});return J({likes:(await q(c,"SELECT user_id FROM comment_likes WHERE comment_id=?",id).all()).results.map(x=>x.user_id)})});
+route("DELETE","/comments/(\\d+)",async c=>{const u=need(c),cm=await q(c,"SELECT c.author_id,c.post_id,p.author_id pa FROM comments c JOIN posts p ON p.id=c.post_id WHERE c.id=?",+c.p[0]).first();if(!cm)return J({error:"Not found"},404);
+  if(cm.author_id!==u.id&&cm.pa!==u.id&&u.role!=="admin")return J({error:"Not allowed"},403);await q(c,"DELETE FROM comments WHERE id=?",+c.p[0]).run();await emit(c.env,{t:"pu",id:cm.post_id});return J({ok:true})});
+route("POST","/views",async c=>{const u=need(c),b=await body(c.req),st=[];
+  for(const[list,kind]of[[b.posts,"post"],[b.reels,"reel"]])for(const id of(Array.isArray(list)?list:[]).slice(0,10)){const pid=Math.floor(+id);if(pid>0)st.push(q(c,"INSERT OR IGNORE INTO post_views(post_id,user_id,kind,created_at) SELECT p.id,?2,?3,?4 FROM posts p WHERE p.id=?1 AND p.author_id<>?2",pid,u.id,kind,now()))}
+  if(st.length)await c.env.DB.batch(st);return J({ok:true})});
+route("POST","/stories/(\\d+)/view",async c=>{const u=need(c);await q(c,"INSERT OR IGNORE INTO story_views(story_id,user_id,created_at) SELECT s.id,?2,?3 FROM stories s WHERE s.id=?1 AND s.author_id<>?2 AND s.created_at>?4",+c.p[0],u.id,now(),now()-864e5).run();return J({ok:true})});
+route("GET","/stories/(\\d+)/viewers",async c=>{const u=need(c),s=await q(c,"SELECT author_id FROM stories WHERE id=?",+c.p[0]).first();if(!s)return J({error:"Not found"},404);if(s.author_id!==u.id&&u.role!=="admin")return J({error:"Not allowed"},403);
+  const rs=(await q(c,"SELECT user_id,created_at t FROM story_views WHERE story_id=? ORDER BY created_at DESC LIMIT 200",+c.p[0]).all()).results,users=await usersByIds(c,rs.map(r=>r.user_id));
+  return J({viewers:rs.map(r=>({user:users[r.user_id],t:r.t})).filter(x=>x.user)})});
+route("GET","/users/([^/]+)/connections",async c=>{const u=need(c),id=c.p[0],fo=c.url.searchParams.get("type")==="following";
+  const ids=(await q(c,fo?"SELECT following_id uid FROM follows WHERE follower_id=?1 ORDER BY created_at DESC LIMIT 200":"SELECT follower_id uid FROM follows WHERE following_id=?1 ORDER BY created_at DESC LIMIT 200",id).all()).results.map(r=>r.uid),users=await usersByIds(c,ids);
+  return J({users:ids.map(i=>users[i]).filter(x=>x&&x.status==="active")})});
 
 // ---------- account ----------
 route("POST","/register",async c=>{
@@ -446,10 +470,13 @@ let schemaReady=null;
 async function ensureSchema(env){ // adds anything an older database is missing, so no manual SQL is needed
   const cols=async t=>(await env.DB.prepare(`PRAGMA table_info(${t})`).all()).results.map(r=>r.name);
   const add=async(t,c,def)=>{if(!(await cols(t)).includes(c))await env.DB.prepare(`ALTER TABLE ${t} ADD COLUMN ${c} ${def}`).run()};
-  await add("posts","likes_adjust","INTEGER NOT NULL DEFAULT 0");await add("users","followers_adjust","INTEGER NOT NULL DEFAULT 0");await add("media","kind","TEXT NOT NULL DEFAULT 'image'");
+  await add("posts","likes_adjust","INTEGER NOT NULL DEFAULT 0");await add("users","followers_adjust","INTEGER NOT NULL DEFAULT 0");await add("media","kind","TEXT NOT NULL DEFAULT 'image'");await add("posts","bg","TEXT");await add("notifications","ref","TEXT");
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS post_shares(post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, created_at INTEGER NOT NULL, PRIMARY KEY(post_id,user_id))").run();
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS stories(id INTEGER PRIMARY KEY AUTOINCREMENT, author_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, media_key TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'image', caption TEXT, created_at INTEGER NOT NULL)").run();
-  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_stories_time ON stories(created_at)").run()}
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_stories_time ON stories(created_at)").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS comment_likes(comment_id INTEGER NOT NULL REFERENCES comments(id) ON DELETE CASCADE, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, created_at INTEGER NOT NULL, PRIMARY KEY(comment_id,user_id))").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS post_views(post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, kind TEXT NOT NULL CHECK(kind IN ('post','reel')), created_at INTEGER NOT NULL, PRIMARY KEY(post_id,user_id,kind))").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS story_views(story_id INTEGER NOT NULL REFERENCES stories(id) ON DELETE CASCADE, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, created_at INTEGER NOT NULL, PRIMARY KEY(story_id,user_id))").run()}
 const ensureReady=env=>{if(!schemaReady)schemaReady=ensureSchema(env).catch(e=>{schemaReady=null;throw e});return schemaReady};
 const msg=e=>String(e&&e.message||e).slice(0,140);
 async function health(env){const out={database:false,pictures_bucket:!!bucket(env),realtime:!!env.HUB,admin_email_set:!!(env.ADMIN_EMAIL||"").trim(),chairman_email_set:!!(env.CHAIRMAN_EMAIL||"").trim()};
