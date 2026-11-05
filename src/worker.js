@@ -144,9 +144,12 @@ route("POST","/stories",async c=>{const u=need(c),b=await body(c.req),k=str(b.me
   if(!m)return J({error:"Invalid attachment"},400);
   await q(c,"INSERT INTO stories(author_id,media_key,kind,caption,created_at) VALUES(?,?,?,?,?)",u.id,k,m.kind,str(b.caption,120),now()).run();return J({ok:true},201)});
 route("GET","/stories",async c=>{const u=need(c);
-  const rs=(await q(c,`SELECT s.id,s.author_id,s.media_key,s.kind,s.caption,s.created_at,(SELECT COUNT(*) FROM story_views v WHERE v.story_id=s.id) vc,EXISTS(SELECT 1 FROM story_views v WHERE v.story_id=s.id AND v.user_id=?2) sn FROM stories s JOIN users a ON a.id=s.author_id WHERE s.created_at>?3 AND a.status='active' AND (s.author_id=?2 OR s.author_id IN (SELECT following_id FROM follows WHERE follower_id=?2) OR a.role IN ('chairman','admin')) AND s.author_id NOT IN (SELECT target_id FROM user_relations WHERE user_id=?2 AND kind IN ('block','mute')) ORDER BY s.id`,0,u.id,now()-864e5).all()).results;
-  const users=await usersByIds(c,rs.map(r=>r.author_id)),g={};for(const r of rs)(g[r.author_id]=g[r.author_id]||[]).push({id:r.id,url:mediaUrl(r.media_key),kind:r.kind,caption:r.caption||"",t:r.created_at,seen:!!r.sn||r.author_id===u.id,views:r.author_id===u.id||u.role==="admin"?r.vc:null});
-  return J({users,stories:Object.entries(g).map(([id,items])=>({user:id,items}))})});
+  const rs=(await q(c,`SELECT s.id,s.author_id,s.media_key,s.kind,s.caption,s.created_at,(SELECT COUNT(*) FROM story_views v WHERE v.story_id=s.id) vc,EXISTS(SELECT 1 FROM story_views v WHERE v.story_id=s.id AND v.user_id=?2) sn FROM stories s JOIN users a ON a.id=s.author_id WHERE s.created_at>?3 AND a.status='active' AND s.author_id NOT IN (SELECT target_id FROM user_relations WHERE user_id=?2 AND kind IN ('block','mute')) AND s.author_id NOT IN (SELECT user_id FROM user_relations WHERE target_id=?2 AND kind='block') ORDER BY s.id DESC LIMIT 300`,0,u.id,now()-864e5).all()).results;
+  const users=await usersByIds(c,rs.map(r=>r.author_id)),g={};for(const r of[...rs].reverse())(g[r.author_id]=g[r.author_id]||[]).push({id:r.id,url:mediaUrl(r.media_key),kind:r.kind,caption:r.caption||"",t:r.created_at,seen:!!r.sn||r.author_id===u.id,views:r.author_id===u.id||u.role==="admin"?r.vc:null});
+  const gr=Object.entries(g).map(([id,items])=>({user:id,items}));
+  for(let i=gr.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[gr[i],gr[j]]=[gr[j],gr[i]]}
+  gr.sort((x,y)=>(y.user===u.id)-(x.user===u.id)); // your own story first, everyone else in random order
+  return J({users,stories:gr})});
 route("DELETE","/stories/(\\d+)",async c=>{const u=need(c),s=await q(c,"SELECT author_id,media_key FROM stories WHERE id=?",+c.p[0]).first();if(!s)return J({error:"Not found"},404);
   if(s.author_id!==u.id&&u.role!=="admin")return J({error:"Not allowed"},403);await bucket(c.env).delete(s.media_key);await q(c,"DELETE FROM media WHERE key=?",s.media_key).run();await q(c,"DELETE FROM stories WHERE id=?",+c.p[0]).run();return J({ok:true})});
 
